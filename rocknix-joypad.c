@@ -636,6 +636,41 @@ static int joypad_dt_parse(struct device *dev, struct joypad *joypad)
 	return error;
 }
 
+
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 13, 0))
+static void joypad_remove(struct platform_device *pdev)
+#else
+static int joypad_remove(struct platform_device *pdev)
+#endif
+{
+    struct joypad *joypad = platform_get_drvdata(pdev);
+    
+    if (joypad && joypad->poll_dev) {
+        input_unregister_polled_device(joypad->poll_dev);
+    }
+    
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0))
+    return 0;
+#endif
+}
+
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 13, 0))
+static void joypad_remove(struct platform_device *pdev)
+#else
+static int joypad_remove(struct platform_device *pdev)
+#endif
+{
+    struct joypad *joypad = platform_get_drvdata(pdev);
+    
+    if (joypad && joypad->poll_dev) {
+        input_unregister_polled_device(joypad->poll_dev);
+    }
+    
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0))
+    return 0;
+#endif
+}
+
 /*----------------------------------------------------------------------------*/
 static int joypad_probe(struct platform_device *pdev)
 {
