@@ -16,7 +16,19 @@
 #else
 #include <linux/of_gpio_legacy.h>
 #endif
+#include <linux/delay.h>
+#include <linux/pwm.h>
 #include "rocknix-joypad.h"
+
+#include <linux/kthread.h>
+#include <linux/tty.h>
+#include <linux/tty_driver.h>
+#include <linux/tty_flip.h>
+#include <linux/fs.h>
+#include <linux/termios.h>
+#include <linux/uaccess.h>
+#include <linux/workqueue.h>
+#include <linux/jiffies.h>
 
 /*----------------------------------------------------------------------------*/
 #define DRV_NAME "rocknix-joypad"
@@ -28,6 +40,7 @@
 #define	ADC_MAX_VOLTAGE		1800
 #define	ADC_DATA_TUNING(x, p)	((x * p) / 100)
 #define	ADC_TUNING_DEFAULT	180
+#define	CLAMP(x, low, high)  (((x) > (high)) ? (high) : (((x) < (low)) ? (low) : (x)))
 
 struct bt_adc {
 	/* report value (mV) */
@@ -86,6 +99,7 @@ struct joypad {
 	bool invert_absry;
 	bool invert_absz;
 	bool invert_absrz;
+	bool skip_absr;
 
 	/* report interval (ms) */
 	int bt_gpio_count;
@@ -102,7 +116,84 @@ struct joypad {
 	int bt_adc_deadzone;
 
 	struct mutex lock;
+
+	/* pwm device for rumble*/
+	struct input_dev *input;
+	struct pwm_device *pwm;
+	struct work_struct play_work;
+	u16 level;
+	u16 boost_weak;
+	u16 boost_strong;
+	bool has_rumble;
+	bool rumble_enabled; /* to turn rumble on/off if a device has it */
+	int rumble_gpio;
 };
+
+static int pwm_vibrator_start(struct joypad *joypad)
+{
+	struct pwm_state state;
+	int err;
+
+	pwm_get_state(joypad->pwm, &state);
+	pwm_set_relative_duty_cycle(&state, joypad->level, 0xffff);
+	state.enabled = true;
+
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0))
+	err = pwm_apply_state(joypad->pwm, &state);
+#else
+	err = pwm_apply_might_sleep(joypad->pwm, &state);
+#endif
+	if (err) {
+		 dev_err(joypad->dev, "failed to apply pwm state: %d", err);
+		 return err;
+	}
+
+	return 0;
+}
+
+static int joypad_vibrator_start(struct joypad *joypad)
+{
+	if (joypad->rumble_gpio) {
+		gpio_set_value(joypad->rumble_gpio, 1);
+		return 0;
+	}
+	return pwm_vibrator_start(joypad);
+}
+
+static void pwm_vibrator_stop(struct joypad *joypad)
+{
+	if (joypad->rumble_gpio) {
+		gpio_set_value(joypad->rumble_gpio, 0);
+		return;
+	}
+
+	pwm_disable(joypad->pwm);
+}
+
+
+static void joypad_vibrator_stop(struct joypad *joypad)
+{
+	pwm_vibrator_stop(joypad);
+}
+
+static void joypad_vibrator_play_work(struct work_struct *work)
+{
+	struct joypad *joypad = container_of(work,
+					    struct joypad, play_work);
+	mutex_lock(&joypad->lock);
+	if (!joypad->rumble_enabled) {
+		joypad_vibrator_stop(joypad);
+		mutex_unlock(&joypad->lock);
+		return;
+	}
+
+	if (joypad->level)
+		 joypad_vibrator_start(joypad);
+	else
+		 joypad_vibrator_stop(joypad);
+
+	mutex_unlock(&joypad->lock);
+}
 
 /*----------------------------------------------------------------------------*/
 static int joypad_adc_read(struct joypad *joypad, struct bt_adc *adc)
@@ -148,10 +239,11 @@ static void joypad_adc_check(struct input_polled_dev *poll_dev)
 	struct joypad *joypad = poll_dev->private;
 	int nbtn;
 	int mag;
+	int start_index = joypad->skip_absr ? 2 : 0;
 
 	/* Assumes an even number of axes and that joystick axis pairs are sequential */
 	/* e.g. left stick Y immediately follows left stick X */
-	for (nbtn = 0; nbtn < joypad->chan_count; nbtn += 2) {
+	for (nbtn = start_index; nbtn < joypad->chan_count; nbtn += 2) {
 		struct bt_adc *adcx = &joypad->adcs[nbtn];
 		struct bt_adc *adcy = &joypad->adcs[nbtn + 1];
 
@@ -270,6 +362,11 @@ static void joypad_open(struct input_polled_dev *poll_dev)
 static void joypad_close(struct input_polled_dev *poll_dev)
 {
 	struct joypad *joypad = poll_dev->private;
+
+	if (joypad->has_rumble) {
+		cancel_work_sync(&joypad->play_work);
+		joypad_vibrator_stop(joypad);
+	}
 
 	/* button report disable */
 	mutex_lock(&joypad->lock);
@@ -432,6 +529,69 @@ static int joypad_adc_setup(struct device *dev, struct joypad *joypad)
 }
 
 /*----------------------------------------------------------------------------*/
+static int rumble_play_effect(struct input_dev *dev, void *data, struct ff_effect *effect)
+{
+	struct joypad *joypad = data;
+	u32 boosted_level;
+	if (effect->type != FF_RUMBLE)
+		 return 0;
+
+	mutex_lock(&joypad->lock);
+	if (!joypad->rumble_enabled) {
+		mutex_unlock(&joypad->lock);
+		return 0; // Ignore rumble effects if disabled
+	}
+
+	if (effect->u.rumble.strong_magnitude)
+		boosted_level = effect->u.rumble.strong_magnitude + joypad->boost_strong;
+	else
+		boosted_level = effect->u.rumble.weak_magnitude + joypad->boost_weak;
+
+	joypad->level = (u16)CLAMP(boosted_level, 0, 0xffff);
+
+	mutex_unlock(&joypad->lock);
+
+	schedule_work(&joypad->play_work);
+	return 0;
+}
+
+/*----------------------------------------------------------------------------*/
+static int joypad_rumble_setup(struct device *dev, struct joypad *joypad)
+{
+	int error;
+	struct pwm_state state;
+
+	INIT_WORK(&joypad->play_work, joypad_vibrator_play_work);
+
+	if (joypad->rumble_gpio)
+		return 0;
+
+	joypad->pwm = devm_pwm_get(dev, "enable");
+	if (IS_ERR(joypad->pwm)) {
+		dev_err(dev, "rumble get error\n");
+		return -EINVAL;
+	}
+
+	/* Sync up PWM state and ensure it is off. */
+	pwm_init_state(joypad->pwm, &state);
+	state.enabled = false;
+
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0))
+	error = pwm_apply_state(joypad->pwm, &state);
+#else
+	error = pwm_apply_might_sleep(joypad->pwm, &state);
+#endif
+	if (error) {
+		 dev_err(dev, "failed to apply initial PWM state: %d",
+			 error);
+		 return error;
+	}
+
+	dev_info(dev, "rumble setup success!\n");
+	return 0;
+}
+
+/*----------------------------------------------------------------------------*/
 static int joypad_gpio_setup(struct device *dev, struct joypad *joypad)
 {
 	struct device_node *node, *pp;
@@ -560,6 +720,24 @@ static int joypad_input_setup(struct device *dev, struct joypad *joypad)
 				gpio->linux_code);
 	}
 
+	/* Rumble setup */
+	if (joypad->has_rumble) {
+		u32 boost_weak = 0;
+		u32 boost_strong = 0;
+		device_property_read_u32(dev, "rumble-boost-weak", &boost_weak);
+		device_property_read_u32(dev, "rumble-boost-strong", &boost_strong);
+		joypad->boost_weak = boost_weak;
+		joypad->boost_strong = boost_strong;
+		dev_info(dev, "Boost = %d, %d", boost_weak, boost_strong);
+		input_set_capability(input, EV_FF, FF_RUMBLE);
+		error = input_ff_create_memless(input, joypad, rumble_play_effect);
+		if (error) {
+			dev_err(dev, "unable to register rumble, err=%d\n",
+				error);
+			return error;
+		}
+	}
+
 	if (joypad->auto_repeat)
 		__set_bit(EV_REP, input->evbit);
 
@@ -581,6 +759,7 @@ static int joypad_input_setup(struct device *dev, struct joypad *joypad)
 static int joypad_dt_parse(struct device *dev, struct joypad *joypad)
 {
 	int error = 0;
+	enum of_gpio_flags flags;
 
 	/* initialize values from device-tree */
 	device_property_read_u32(dev, "button-adc-fuzz",
@@ -599,6 +778,8 @@ static int joypad_dt_parse(struct device *dev, struct joypad *joypad)
 				&joypad->poll_interval);
 
 	joypad->auto_repeat = device_property_present(dev, "autorepeat");
+	joypad->skip_absr = device_property_present(dev, "skip-absr");
+	dev_info(dev, "%s : skip-absr = %d\n", __func__, joypad->skip_absr);
 
 	/* change the report reference point? (ADC MAX - read value) */
 	joypad->invert_absx = device_property_present(dev, "invert-absx");
@@ -629,6 +810,23 @@ static int joypad_dt_parse(struct device *dev, struct joypad *joypad)
 	error = joypad_gpio_setup(dev, joypad);
 	if (error)
 		return error;
+
+	joypad->rumble_gpio = of_get_named_gpio_flags(dev->of_node, "rumble-gpio", 0, &flags);
+	if (gpio_is_valid(joypad->rumble_gpio)) {
+		error = devm_gpio_request(dev, joypad->rumble_gpio, "rumble-gpio");
+		if (error < 0) {
+			dev_err(dev, "%s : failed to request rumble gpio %d\n",
+				__func__, joypad->rumble_gpio);
+			return error;
+		}
+		error = gpio_direction_output(joypad->rumble_gpio, 0);
+		if (error < 0)
+			return error;
+		joypad->has_rumble = true;
+		dev_info(dev, "%s : has gpio rumble\n", __func__);
+	} else {
+		dev_err(dev, "joypad rumble gpio error!");
+	}
 
 	dev_info(dev, "%s : adc key cnt = %d, gpio key cnt = %d\n",
 			__func__, joypad->chan_count, joypad->bt_gpio_count);
@@ -665,6 +863,17 @@ static int joypad_probe(struct platform_device *pdev)
 		dev_err(dev, "input setup failed!(err = %d)\n", error);
 		return error;
 	}
+
+        if (joypad->has_rumble) {
+		error = joypad_rumble_setup(dev, joypad);
+		if (error) {
+			 dev_err(dev, "rumble setup failed!(err = %d)\n", error);
+			 return error;
+		}
+
+		joypad->rumble_enabled = true;
+	}
+
 	dev_info(dev, "%s : probe success\n", __func__);
 	return 0;
 }
