@@ -148,7 +148,7 @@ static int pwm_vibrator_start(struct joypad *joypad)
 
 static int joypad_vibrator_start(struct joypad *joypad)
 {
-	if (joypad->rumble_gpio) {
+	if (gpio_is_valid(joypad->rumble_gpio)) {
 		gpio_set_value(joypad->rumble_gpio, 1);
 		return 0;
 	}
@@ -157,7 +157,7 @@ static int joypad_vibrator_start(struct joypad *joypad)
 
 static void pwm_vibrator_stop(struct joypad *joypad)
 {
-	if (joypad->rumble_gpio) {
+	if (gpio_is_valid(joypad->rumble_gpio)) {
 		gpio_set_value(joypad->rumble_gpio, 0);
 		return;
 	}
@@ -539,8 +539,10 @@ static int joypad_rumble_setup(struct device *dev, struct joypad *joypad)
 
 	INIT_WORK(&joypad->play_work, joypad_vibrator_play_work);
 
-	if (joypad->rumble_gpio)
+	if (gpio_is_valid(joypad->rumble_gpio)) {
+		dev_info(dev, "rumble setup with gpio success!\n");
 		return 0;
+	}
 
 	joypad->pwm = devm_pwm_get(dev, "enable");
 	if (IS_ERR(joypad->pwm)) {
@@ -777,6 +779,11 @@ static int joypad_dt_parse(struct device *dev, struct joypad *joypad)
 	error = joypad_gpio_setup(dev, joypad);
 	if (error)
 		return error;
+
+	joypad->has_rumble =
+		device_property_present(dev, "pwm-names");
+	if (joypad->has_rumble)
+		dev_info(dev, "%s : has rumble\n", __func__);
 
 	joypad->rumble_gpio = of_get_named_gpio_flags(dev->of_node, "rumble-gpio", 0, &flags);
 	if (gpio_is_valid(joypad->rumble_gpio)) {

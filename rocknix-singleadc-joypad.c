@@ -262,7 +262,7 @@ static int pwm_vibrator_start(struct joypad *joypad)
 
 static int joypad_vibrator_start(struct joypad *joypad)
 {
-	if (joypad->rumble_gpio) {
+	if (gpio_is_valid(joypad->rumble_gpio)) {
 		gpio_set_value(joypad->rumble_gpio, 1);
 		return 0;
 	}
@@ -271,7 +271,7 @@ static int joypad_vibrator_start(struct joypad *joypad)
 
 static void pwm_vibrator_stop(struct joypad *joypad)
 {
-	if (joypad->rumble_gpio) {
+	if (gpio_is_valid(joypad->rumble_gpio)) {
 		gpio_set_value(joypad->rumble_gpio, 0);
 		return;
 	}
@@ -869,7 +869,7 @@ static int joypad_rumble_setup(struct device *dev, struct joypad *joypad)
 
 	INIT_WORK(&joypad->play_work, joypad_vibrator_play_work);
 
-	if (joypad->rumble_gpio)
+	if (gpio_is_valid(joypad->rumble_gpio))
 		return 0;
 
 	joypad->pwm = devm_pwm_get(dev, "enable");
