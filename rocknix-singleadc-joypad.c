@@ -1371,7 +1371,7 @@ static int joypad_dt_parse(struct device *dev, struct joypad *joypad)
 
 	joypad->rumble_gpio = of_get_named_gpio_flags(dev->of_node, "rumble-gpio", 0, &flags);
 	if (gpio_is_valid(joypad->rumble_gpio)) {
-		error = devm_gpio_request(dev, joypad->rumble_gpio, "rumble-gpio");
+		error = devm_gpio_request_one(dev, joypad->rumble_gpio, GPIOF_IN, "rumble-gpio");
 		if (error < 0) {
 			dev_err(dev, "%s : failed to request rumble gpio %d\n",
 				__func__, joypad->rumble_gpio);
